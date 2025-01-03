@@ -1,14 +1,14 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery)]
 
+use std::{env, process::Command};
+
 use bat::PrettyPrinter;
 use clap::Parser;
 use colored::Colorize;
 use config::Config;
-use question::{Answer, Question};
 use reqwest::blocking::Client;
 use serde_json::json;
 use spinners::{Spinner, Spinners};
-use std::process::Command;
 
 mod config;
 
@@ -18,9 +18,9 @@ struct Cli {
     /// Description of the command to execute
     prompt: Vec<String>,
 
-    /// Run the generated program without asking for confirmation
-    #[clap(short = 'y', long)]
-    force: bool,
+    /// Silent mode
+    #[clap(short, long, default_value_t = false)]
+    silent: bool,
 }
 
 fn main() {
@@ -34,14 +34,25 @@ fn main() {
         .post(api_addr)
         .json(&json!({
             "top_p": 1,
-            "stop": "```",
             "temperature": 0,
-            "suffix": "\n```",
-            "max_tokens": 1000,
+            "max_tokens": 2048,
             "presence_penalty": 0,
             "frequency_penalty": 0,
-            "model": "gpt-3.5-turbo-instruct",
-            "prompt": build_prompt(&cli.prompt.join(" ")),
+            "stream": false,
+            "model": config.model,
+            "response_format": {
+                "type": "json_object",
+            },
+            "messages": [
+                {
+                    "role": "system",
+                    "content": config.system_prompt
+                },
+                {
+                    "role": "user",
+                    "content": &cli.prompt.join(" ")
+                }
+            ]
         }))
         .header("Authorization", format!("Bearer {}", config.api_key))
         .send()
@@ -66,83 +77,56 @@ fn main() {
         std::process::exit(1);
     }
 
-    let code = response.json::<serde_json::Value>().unwrap()["choices"][0]["text"]
+    let content = response.json::<serde_json::Value>().unwrap()["choices"][0]["message"]["content"]
         .as_str()
         .unwrap()
         .trim()
         .to_string();
 
-    spinner.stop_and_persist(
-        "✔".green().to_string().as_str(),
-        "Got some code!".green().to_string(),
-    );
+    let result: serde_json::Value = serde_json::from_str(&content).unwrap();
 
-    PrettyPrinter::new()
-        .input_from_bytes(code.as_bytes())
-        .language("bash")
-        .grid(true)
-        .print()
-        .unwrap();
+    if let Some(command) = result["command"].as_str() {
+        let command = command.trim();
 
-    let should_run = if cli.force {
-        true
-    } else {
-        Question::new(
-            ">> Run the generated program? [Y/n]"
-                .bright_black()
-                .to_string()
-                .as_str(),
-        )
-        .yes_no()
-        .until_acceptable()
-        .default(Answer::YES)
-        .ask()
-        .expect("Couldn't ask question.")
-            == Answer::YES
-    };
-
-    if should_run {
-        config.write_to_history(code.as_str());
-        spinner = Spinner::new(Spinners::BouncingBar, "Executing...".into());
-
-        let output = Command::new("bash")
-            .arg("-c")
-            .arg(code.as_str())
-            .output()
-            .unwrap_or_else(|_| {
+        if !command.is_empty() {
+            if !cli.silent {
                 spinner.stop_and_persist(
-                    "✖".red().to_string().as_str(),
-                    "Failed to execute the generated program.".red().to_string(),
+                    "✔".green().to_string().as_str(),
+                    "Got some code!".green().to_string(),
                 );
-                std::process::exit(1);
-            });
 
-        if !output.status.success() {
-            spinner.stop_and_persist(
-                "✖".red().to_string().as_str(),
-                "The program threw an error.".red().to_string(),
-            );
-            println!("{}", String::from_utf8_lossy(&output.stderr));
-            std::process::exit(1);
+                PrettyPrinter::new()
+                    .input_from_bytes(command.as_bytes())
+                    .language("bash")
+                    .grid(true)
+                    .print()
+                    .unwrap();
+            }
+
+            if !config.post_command.is_empty() {
+                Command::new(config.shell)
+                    .arg("-c")
+                    .arg(config.post_command)
+                    .env("PLZ_GENERATED_COMMAND", command)
+                    .env(
+                        "PLZ_EXECUTABLE",
+                        env::current_exe().unwrap().to_str().unwrap(),
+                    )
+                    .spawn()
+                    .unwrap();
+            }
+
+            std::process::exit(0);
         }
-
-        spinner.stop_and_persist(
-            "✔".green().to_string().as_str(),
-            "Command ran successfully".green().to_string(),
-        );
-
-        println!("{}", String::from_utf8_lossy(&output.stdout));
     }
-}
 
-fn build_prompt(prompt: &str) -> String {
-    let os_hint = if cfg!(target_os = "macos") {
-        " (on macOS)"
-    } else if cfg!(target_os = "linux") {
-        " (on Linux)"
-    } else {
-        ""
-    };
+    let message = result["message"]
+        .as_str()
+        .unwrap_or("Generate failed")
+        .to_string();
 
-    format!("{prompt}{os_hint}:\n```bash\n#!/bin/bash\n")
+    spinner.stop_and_persist(
+        "✖".red().to_string().as_str(),
+        format!("{message}").red().to_string(),
+    );
 }
